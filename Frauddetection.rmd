@@ -1,0 +1,432 @@
+---
+title: "Health care fraud detection"
+author: "Spandana Makeneni"
+date: "10/8/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#Loading libraries and input files 
+```{r }
+library(tidyverse)
+library(ggthemr)
+library(ggpubr)
+library(naniar)
+library(ggridges)
+library(moments)
+library(caret)
+library(rcompanion)
+library(gbm)
+library(xgboost)
+library(Metrics)
+ggthemr(palette = "solarized")
+
+train_beneficiary <- read.csv("/Users/spandana/Desktop/Data_science_projects/Healthcare_fraud_detection/Train_Beneficiarydata.csv")
+train_inpatient <- read.csv("/Users/spandana/Desktop/Data_science_projects/Healthcare_fraud_detection/Train_Inpatientdata.csv")
+train_outpatient <- read.csv("/Users/spandana/Desktop/Data_science_projects/Healthcare_fraud_detection/Train_Outpatientdata.csv")
+train_labels <- read.csv("/Users/spandana/Desktop/Data_science_projects/Healthcare_fraud_detection/Train.csv")
+States <- read.csv("/Users/spandana/Desktop/Data_science_projects/Healthcare_fraud_detection/States.csv",header=FALSE)
+colnames(States)<-c("State","State_name")
+```
+
+#Data sets
+
+**Inpatient Dataset** - This data provides insights about the claims filed for those patients who are admitted in the hospitals. It also provides additional details like their admission and discharge dates and admit d diagnosis code.
+
+**Outpatient Dataset** - This data provides details about the claims filed for those patients who visit hospitals and not admitted in it.
+
+**Beneficiary Dataset** - This data contains beneficiary KYC details like health conditions,region they belong to etc.
+
+**Lets take a look at the dimensions and datatypes of each dataset**
+
+```{r}
+print("Column names and data types for Inpatient Dataset")
+str(train_inpatient)
+print("Column names and data types for Outpatient Dataset")
+str(train_outpatient)
+print("Column names and data types for Beneficiary Dataset")
+str(train_beneficiary)
+```
+
+Insights:
+1) Dates were read as factors. Lets change that.
+2) There are some missing values. Lets take a look at those.
+
+```{r formattingdates}
+date_colnames <- c("ClaimStartDt","ClaimEndDt","AdmissionDt","DischargeDt","DOB","DOD")
+train_inpatient[,date_colnames[1:4]] <- lapply(train_inpatient[,date_colnames[1:4]],as.Date)
+train_outpatient[,date_colnames[1:2]] <- lapply(train_outpatient[,date_colnames[1:2]],as.Date)
+train_beneficiary[,date_colnames[5:6]] <- lapply(train_beneficiary[,date_colnames[5:6]],as.Date)
+```
+
+#Data preprocessing 
+#Missing values
+```{r checkingmissingvalues}
+
+#Function to plot missing values 
+plot_missingvalues <- function(df,title_name){
+  df_missing <- miss_var_summary(df)
+  p <- ggplot(df_missing,aes(x=reorder(variable,-pct_miss),y=pct_miss,label=round(pct_miss,1)))+geom_segment(aes(x=reorder(variable,-pct_miss),xend=reorder(variable,-pct_miss),y=0,yend=pct_miss))+geom_point(size=4,alpha=0.6)+geom_text(nudge_x =0.2,nudge_y=3.5)+labs(y="% missing",x="",title=title_name)+coord_flip()
+  print(p)
+}
+
+plot_missingvalues(train_inpatient,"Missing values in Inpatient data")
+plot_missingvalues(train_outpatient,"Missing values in Outpatient data")
+plot_missingvalues(train_beneficiary,"Missing values in Beneficiary data")
+```
+#Data cleaning 
+
+Step1:   
+Dropping the following columns because 100% of the data is missing:  
+1) ClmProcedure code 4,5,6 from the inpatient data 
+2) ClmProcedureCode 1,2,3,4,5,6 from the outpaitent data -  After researching a little I found that frequently these columns exist in the claims data but when they are not the basis of payment they are empty. 
+3) DOD - Date of Death  
+
+```{r dropping columns}
+train_inpatient <- train_inpatient %>% select(-ClmProcedureCode_4,-ClmProcedureCode_5,-ClmProcedureCode_6)
+train_outpatient <- train_outpatient %>%  select(-starts_with("ClmProcedure"))
+train_beneficiary <- train_beneficiary %>% select(-DOD)
+```
+
+Ok, lets deal with the remaining missing values in each data set  
+
+Step 2:  
+Inpatient and Outpatient data sets- Missing values in Physician columns, Diagnosis codes, and procedure codes.
+
+For Physician columns - Replace NAs with "None"
+For Diagnosis codes  and procedure codes - Replace NAs with 0 
+```{r replotting missing values after deleting some columns}
+replace_NAs_None <- function(df){
+df$AttendingPhysician <- factor(df$AttendingPhysician,levels=c(levels(df$AttendingPhysician),"None"))
+df$OperatingPhysician <- factor(df$OperatingPhysician,levels=c(levels(df$OperatingPhysician),"None"))
+df$OtherPhysician <- factor(df$OtherPhysician,levels=c(levels(df$df$OtherPhysician),"None"))
+df$AttendingPhysician[is.na(df$AttendingPhysician)] <- "None"
+df$OperatingPhysician[is.na(df$OperatingPhysician)] <- "None"
+df$OtherPhysician[is.na(df$OtherPhysician)] <- "None"
+return(df)
+}
+
+train_inpatient <- replace_NAs_None(train_inpatient)
+train_inpatient <- train_inpatient %>% mutate_if(is.factor,fct_explicit_na,na_level="0")
+train_inpatient[is.na(train_inpatient)] <-0 
+train_outpatient <- replace_NAs_None(train_outpatient)
+train_outpatient <- train_outpatient %>% mutate_if(is.factor,fct_explicit_na,na_level="0")
+train_outpatient[is.na(train_outpatient)] <- 0
+```
+
+Alright,there are no missing values.
+
+Step 3:
+Chronic conditions are listed as 1=Yes, 2=No
+We will convert 2 to 0 just for ease of computation 
+Add a new column age will be more useful than date of birth
+Adding a new column of state names 
+
+```{r converting 2s to 0s}
+train_beneficiary[,10:20][train_beneficiary[,10:20]==2] <- 0
+train_beneficiary <- train_beneficiary %>% mutate(Age=round(as.numeric(as.Date("2009-12-31")-DOB)/365))
+train_beneficiary <- left_join(train_beneficiary,States)
+```
+
+Step 4:
+Add a column for total duration in hospital =  DischargeDt-AdmissionDt
+```{r adding duration}
+train_inpatient <- train_inpatient %>% mutate(Totalstay_days=round(as.numeric(DischargeDt-AdmissionDt))+1)
+train_inpatient <- train_inpatient %>% mutate(Claimlength=round(as.numeric(ClaimEndDt-ClaimStartDt)))
+train_inpatient <- train_inpatient %>% mutate(Type="Inpatient")
+
+train_outpatient <- train_outpatient %>% mutate(Claimlength=round(as.numeric(ClaimEndDt-ClaimStartDt)))
+train_outpatient <- train_outpatient %>% mutate(Type="Outpatient")
+```
+
+#Joining the beneficiary and Inpatient, Outpatient datsets for analysis 
+
+```{r joining datasets}
+Merged_in_ben_fruad<- inner_join(train_inpatient,train_beneficiary)
+Merged_in_ben_fruad<- inner_join(Merged_in_ben_fruad,train_labels)
+
+Merged_out_ben_fraud <- inner_join(train_outpatient,train_beneficiary)
+Merged_out_ben_fraud <- inner_join(Merged_out_ben_fraud,train_labels)
+
+all_data<-bind_rows(Merged_in_ben_fruad,Merged_out_ben_fraud)
+all_data<-all_data %>% mutate_if(is.factor,fct_explicit_na,na_level="0")
+all_data$AdmissionDt[is.na(all_data$AdmissionDt)] <- as.Date("1970-01-01")
+all_data$DischargeDt[is.na(all_data$DischargeDt)] <- as.Date("1970-01-01")
+all_data[is.na(all_data)] <-0
+all_data$Gender[all_data$Gender==2]<-0
+all_data <- all_data %>% select(-DOB,-State)
+```
+
+Ok, lets explore the data now.
+
+#Exploratory data analysis
+
+First, lets take a look at the target variable 
+
+```{r plotting the target variable}
+ggplot(all_data,aes(x=factor(PotentialFraud)))+geom_bar()+geom_text(stat="count",aes(label=paste(round(stat(prop)*100,0),"%"),group=1,vjust=2.0))+facet_wrap(~Type,scales="free_y")+ labs(y="total",x="",title="Fraud claims in Inpatient and Outpatient data")
+
+ggplot(all_data,aes(x=factor(PotentialFraud)))+geom_bar()+geom_text(stat="count",aes(label=paste(round(stat(prop)*100,0),"%"),group=1,vjust=2.0))
+
+
+```
+Insights: 
+Data sets are slightly imbalanced - What are the ways to deal with this?
+Inpatient has more fraud than outpatient
+
+#Age and Fraud
+```{r}
+#Age distribution
+#Adding Age bin
+all_data <- all_data %>% mutate(Agebin=ifelse(Age>=20 & Age<=40,"20-40",
+                            ifelse(Age>40 & Age<=60,"40-60",
+                            ifelse(Age>60 & Age<=80,"60-80",
+                            ifelse(Age>80 & Age<=100,"80-100","None")))))
+
+ggplot(all_data,aes(x=Age))+geom_histogram(aes(y=..density..),colour="black",fill="white")+geom_density(alpha=0.2)
+ggplot (all_data,aes(x=Age,color=PotentialFraud,fill=PotentialFraud))+geom_histogram(aes(y=..density..),alpha=0.5,position="identity")+geom_density(alpha=0.2)
+
+#Age vs Fraud
+ggplot(all_data,aes(x=PotentialFraud,y=Age,fill=PotentialFraud))+geom_boxplot()
+ggplot(all_data,aes(x=Age,y=PotentialFraud,fill=PotentialFraud))+geom_density_ridges(alpha=0.6,stat="binline",bins=20)
+
+```
+Insight:
+Age seems to have no impact on Fraud
+
+#Gender and Fraud
+```{r}
+ggplot(all_data,aes(x=factor(Gender),fill=PotentialFraud))+geom_bar(position=position_dodge())
+#ggplot(all_data,aes(x=factor(PotentialFraud),fill=factor(Gender)))+geom_bar(position = position_dodge())+
+ # geom_text(stat="count",aes(label=scales::percent(..prop..),group=1))
+```
+Insights:
+There are more females in the dataset than males
+No influence on fraud
+
+#Race and Fraud
+```{r }
+ggplot(all_data,aes(x=Race,fill=PotentialFraud))+geom_bar(position = position_dodge())
+```
+
+Insights:
+Very imbalanced - maybe delete it 
+
+#State and Fraud 
+```{r }
+state_data <- all_data %>% group_by(State_name,PotentialFraud) %>% summarize(total=n())
+state_data <- spread(state_data,PotentialFraud,total)
+state_data <- state_data[-c(1),]
+colnames(state_data) <- c("region","No","Yes")
+state_data$region <- tolower(state_data$region)
+states_map <- map_data("state")
+map_state_date <- left_join(states_map,state_data,by="region")
+state_abbs <- as.data.frame(cbind(state.abb,state.name))
+colnames(state_abbs) <- c("state_abb","region")
+state_abbs$region <- tolower(state_abbs$region)
+map_state_date <- left_join(map_state_date,state_abbs,by="region")
+state_names <- map_state_date %>% group_by(state_abb) %>% summarize(lat=0.5*(max(lat)+min(lat)),long=0.5*(max(long)+min(long)))
+map_state_date <- map_state_date %>% mutate(total=No+Yes)
+
+ggplot(map_state_date,aes(x=long,y=lat))+geom_polygon(aes(group=group,fill=Yes),color="black")+scale_fill_continuous(low="lightblue",high="darkblue")+geom_text(data=state_names,mapping=aes(x=long,y=lat,label=state_abb),color="white",size=3)
+
+ggplot(map_state_date,aes(x=long,y=lat))+geom_polygon(aes(group=group,fill=total),color="black")+scale_fill_continuous(low="lightblue",high="darkblue")+geom_text(data=state_names,mapping=aes(x=long,y=lat,label=state_abb),color="white",size=3)
+
+state_test <- all_data %>% select(Provider,State_name,PotentialFraud) %>% count(Provider,State_name,PotentialFraud) %>% spread(State_name,n) 
+state_test[is.na(state_test)] <-0
+state_test$total <- apply(state_test[,4:54],1,function(x)sum(x>0))
+ggplot(state_test,aes(total))+geom_histogram()+facet_wrap(~PotentialFraud,scales="free_y")
+
+#state_data %>% select(region,Yes) %>% arrange(desc(Yes))
+
+```
+
+#Looks like California, Florida, Newyork, PA, Texas have higher fraud claims than the rest of country.
+
+#Chronic conditions and Fraud 
+```{r }
+all_data$Total_chronicconds <- as.numeric(apply(all_data[,37:47],1,sum))
+all_data <- all_data %>% mutate(chroniccond=ifelse(Total_chronicconds>0,"yes","no"))
+ggplot(all_data,aes(x=Total_chronicconds))+geom_histogram()+facet_wrap(~PotentialFraud,scales="free_y")
+ggplot(all_data,aes(Age,Total_chronicconds))+geom_bar(stat="identity")+facet_wrap(~PotentialFraud,scales="free_y")
+ggplot(all_data,aes(x=as.factor(PotentialFraud),y=Total_chronicconds))+geom_bar(stat="identity",position=position_dodge())
+cc <- all_data %>% select(starts_with("Chronic"),PotentialFraud) %>% gather(chroniccond,value,starts_with("Chronic"))
+cc %>% group_by(chroniccond,value,PotentialFraud) %>% summarize(total=n()) %>% ggplot(aes(x=reorder(chroniccond,total),y=total,fill=PotentialFraud))+geom_bar(stat="identity",position=position_dodge())+theme(axis.text.x = element_text(angle=90))
+cc
+
+```
+
+#Diagnosis codes and Fraud 
+```{r topdiagnosiscodesassociatedwithfraud}
+Top_diagnosiscodes <- all_data %>% select(starts_with("ClmDiagnosisCode"),PotentialFraud,Type) %>% gather(Code,Value,starts_with("ClmDiagnosisCode")) %>% filter(PotentialFraud=="Yes")
+
+Top_diagnosiscodes_nf <- all_data %>% select(starts_with("ClmDiagnosisCode"),PotentialFraud,Type) %>% gather(Code,Value,starts_with("ClmDiagnosisCode")) %>% filter(PotentialFraud=="No")
+
+Overall_top_diagnosiscodes <- Top_diagnosiscodes %>% filter(Value!=0) %>% group_by(Value) %>% summarize(total=n()) %>% arrange(desc(total)) 
+
+Overall_top_diagnosiscodes_nf <- Top_diagnosiscodes_nf %>% filter(Value!=0) %>% group_by(Value) %>% summarize(total=n()) %>% arrange(desc(total)) 
+
+#plotting the top ten codes
+Overall_top_diagnosiscodes[1:10,] %>% ggplot(aes(x=reorder(Value,total),y=total))+geom_bar(stat="identity")+theme(axis.text.x = element_text(angle=80))
+
+#Adding percent column
+#Overall_top_diagnosiscodes <- Overall_top_diagnosiscodes %>% mutate(percent_fraud=total/212796)
+#Overall_top_diagnosiscodes_nf<- Overall_top_diagnosiscodes_nf %>% mutate(percent_notfraud=total/345415)
+all_diagnosis_codes <- inner_join(Overall_top_diagnosiscodes,Overall_top_diagnosiscodes_nf,by="Value")
+all_diagnosis_codes <- all_diagnosis_codes %>% mutate(percent_fraud=total.x/212796)
+all_diagnosis_codes <- all_diagnosis_codes %>% mutate(percent_notfraud=total.y/345415)
+
+ggplot(all_diagnosis_codes,aes(percent_fraud,percent_notfraud))+geom_point()+scale_x_log10()+scale_y_log10()+geom_abline(color="black")
+
+```
+Looks like some codes are strongly associated with fraudulent claims 
+
+```{r top diangnosis codes not associated with fraud}
+#Top_diagnosiscodes_nf <- all_data %>% select(starts_with("ClmDiagnosisCode"),PotentialFraud,Type) %>% gather(Code,Value,starts_with("ClmDiagnosisCode")) %>% filter(PotentialFraud=="No")
+#Top_diagnosiscodes_group_nf <- Top_diagnosiscodes_nf %>% group_by(Code,Value) %>% summarize(total=n()) %>% arrange(desc(total)) %>% slice(1:10)
+#Overall_top_diagnosiscodes_nf <- Top_diagnosiscodes_nf %>% filter(Value!=0) %>% group_by(Value) %>% summarize(total=n()) %>% arrange(desc(total)) %>% slice(1:10)
+#Top_diagnosiscodes_group_nf %>% filter(Value!="0") %>% ggplot(aes(reorder(Value,total),total))+geom_bar(stat="identity")+facet_wrap(~Code,scales="free_x")+theme(axis.text.x = element_text(angle=80))
+#Overall_top_diagnosiscodes_nf %>% ggplot(aes(x=reorder(Value,total),y=total))+geom_bar(stat="identity")+theme(axis.text.x = element_text(angle=80))
+```
+
+#Procedure codes vs Fraud 
+```{r }
+Top_procedurecodes <- all_data %>% select(starts_with("ClmProcedureCode"),PotentialFraud,Type) %>% gather(Code,Value,starts_with("ClmProcedureCode")) %>% filter(PotentialFraud=="Yes")
+
+Top_procedurecodes_nf <- all_data %>% select(starts_with("ClmProcedureCode"),PotentialFraud,Type) %>% gather(Code,Value,starts_with("ClmProcedureCode")) %>% filter(PotentialFraud=="No")
+
+#Top_procedurecodes_group <- Top_procedurecodes %>% group_by(Code,Value) %>% summarize(total=n()) %>% arrange(desc(total)) %>% slice(1:10)
+
+Overall_top_procedurecodes <- Top_procedurecodes %>% filter(Value!=0) %>% group_by(Value) %>% summarize(total=n()) %>% arrange(desc(total)) 
+Overall_top_procedurecodes_nf <- Top_procedurecodes_nf %>% filter(Value!=0) %>% group_by(Value) %>% summarize(total=n()) %>% arrange(desc(total))
+all_procedure_codes <- inner_join(Overall_top_procedurecodes,Overall_top_procedurecodes_nf,by="Value")
+all_procedure_codes <- all_procedure_codes %>% mutate(percent_fraud = total.x/212796)
+all_procedure_codes <- all_procedure_codes %>% mutate(percent_notfraud = total.y/345415)
+
+ggplot(all_procedure_codes,aes(percent_fraud,percent_notfraud))+geom_point()+scale_x_log10()+scale_y_log10()+geom_abline(color="black")
+
+Overall_top_procedurecodes[1:10,] %>% ggplot(aes(x=reorder(Value,total),y=total))+geom_bar(stat="identity")+theme(axis.text.x = element_text(angle=80))
+```
+#Hospital stay and fraud 
+```{r }
+all_data %>% count(Totalstay_days,PotentialFraud) %>%  arrange(desc(n)) %>% filter(Totalstay_days!=0) %>% ggplot(aes(reorder(Totalstay_days,Totalstay_days),n))+geom_bar(stat="identity")+facet_wrap(~PotentialFraud)
+
+```
+#Claim length and fraud 
+```{r }
+all_data %>% count(Claimlength,PotentialFraud) %>% filter(Claimlength!=0) %>% arrange(desc(n)) %>%  ggplot(aes(Claimlength,n))+geom_bar(stat="identity")+facet_wrap(~PotentialFraud)
+
+```
+#Number of claims and Fraud 
+```{r}
+Totalclaims_byuser <- all_data %>% group_by(BeneID) %>% summarize(total=n())
+Fraud_byuser <- all_data %>%count(BeneID,PotentialFraud) 
+Fraud_byuser <- Fraud_byuser %>% spread(PotentialFraud,n)
+Fraud_byuser[is.na(Fraud_byuser)]<-0
+Totalclaims_byuser <- inner_join(Totalclaims_byuser,Fraud_byuser)
+Totalclaims_byuser <- Totalclaims_byuser %>% mutate(Fraud = ifelse(Yes>0,"yes","no"))
+ggplot(Totalclaims_byuser,aes(x=total,fill=Fraud))+geom_histogram( color="#e9ecef", alpha=0.6, position = 'identity') +
+    scale_fill_manual(values=c("#69b3a2", "#404080"))+labs(fill="")+facet_wrap(~Fraud,scales="free_y")
+
+```
+#Total number of codes and Fraud 
+```{r }
+all_data$total_diagnosiscodes <- apply(all_data[,15:24],1,function(x)sum(x>0))
+all_data$total_procedurecodes <- apply(all_data[,25:27],1,function(x)sum(x>0))
+ggplot(all_data,aes(x=total_diagnosiscodes))+geom_histogram(color="#e9ecef",binwidth=1,alpha=0.6,position="identity")+scale_fill_manual(values=c("#69b3a2", "#404080"))+facet_wrap(~PotentialFraud,scales="free_y")
+ggplot(all_data,aes(x=total_procedurecodes,fill=PotentialFraud))+geom_histogram(color="#e9ecef",binwidth=1,alpha=0.6,position="identity")+scale_fill_manual(values=c("#69b3a2", "#404080"))
+
+```
+
+#Getting the dataset ready 
+```{r}
+top_codes_list <- c("4280","2720","2449","V5861","4011","42731","V5869","2724","25000","4019")
+codes_data <- all_data %>% select(starts_with("ClmDiagnosisCode"),Provider) %>% gather(Code,codevalue,starts_with("ClmDiagnosisCode")) %>% group_by(Provider,codevalue) %>% summarize(total=n()) %>% filter(codevalue %in% top_codes_list)
+codes_data <- spread(codes_data,codevalue,total)
+Age_data <- all_data %>% select(Agebin,Provider) %>% gather(Age_bin,bin_value,Agebin) %>% group_by(Provider,bin_value) %>% summarize(total=n()) %>% spread(bin_value,total)
+Remaining_features <- all_data %>% group_by(Provider) %>% summarise(Totalstay_days=mean(Totalstay_days),total_diagnosiscodes=mean(total_diagnosiscodes),Total_chronicconds=mean(Total_chronicconds))
+
+
+modeling_dataframe <- all_data %>% select(Provider,BeneID) %>% group_by(Provider) %>% mutate(Total_patients=n_distinct(BeneID))
+modeling_dataframe <- modeling_dataframe %>% group_by(Provider,Total_patients) %>% summarize(Total_claims=n())
+modeling_dataframe <- full_join(modeling_dataframe,codes_data)
+modeling_dataframe <- full_join(modeling_dataframe,Age_data)
+modeling_dataframe <- full_join(modeling_dataframe,state_test[,c(1,55)])
+modeling_dataframe <- full_join(modeling_dataframe,Remaining_features)
+colnames(modeling_dataframe)[colnames(modeling_dataframe)=="total"] <-"Total_states"
+modeling_dataframe <- modeling_dataframe %>% select(-None)
+modeling_dataframe[is.na(modeling_dataframe)]<-0
+modeling_dataframe <- full_join(modeling_dataframe,train_labels)
+
+```
+
+#Scaling and Transforming
+```{r }
+
+#Function to plot skewness and skew values 
+distbn_plot <- function(df,xname){
+  skew<-skewness(df[,xname])
+  #bw=(max(df[,xname])-min(df[,xname]))/(17)
+  p <- ggplot(df,aes_string(xname))+
+  geom_histogram( )+labs(title=paste("skew: ",round(skew,2)))
+  print(p)
+}  
+
+for(i in colnames(modeling_dataframe[2:21])){
+  print(i)
+   distbn_plot(modeling_dataframe,i)
+}
+
+skewed <- sapply(modeling_dataframe[,2:21],function(x) {ifelse(abs(skewness(x)) > .8,"Yes","No")})
+skewed_colnames <- names(skewed[skewed=="Yes"])
+skewed_colnames
+
+#tranforming data
+#Normalizing skewed numerical columns
+#for(col in skewed_colnames)
+#{
+#  print(col)
+#  modeling_dataframe[,col] <- transformTukey(modeling_dataframe[,col])
+#}
+
+#Scaling variables
+scaled_vals <- preProcess(modeling_dataframe[,2:21], method=c("center", "scale"))
+modeling_dataframe[,2:21] <- predict(scaled_vals,modeling_dataframe[,2:21])
+
+#Model
+modeling_dataframe <- as.data.frame(modeling_dataframe)
+set.seed(143)
+train_partition <- createDataPartition(modeling_dataframe$PotentialFraud,p=0.7,list=F)
+train_model <- modeling_dataframe[train_partition,]
+validate_model <- modeling_dataframe[-train_partition,]
+```
+
+
+#Modeling
+```{r}
+logisticmodel <- glm(PotentialFraud ~ .,data=train_model,family="binomial"(link="logit"))
+summary(logisticmodel)
+```
+
+1) Logistic Regression
+
+
+Relationship between 
+- Age and Fraud - Done 
+- Gender and Fraud - Done
+- Race and fraud - Done 
+- Chronicconditions and Fraud -Done
+- State and Fraud- Done 
+- Diagnosis codes and Fraud - Done
+- Procedure codes and Fraud - Done
+- Hospital stay length and Fraud -Done 
+- Claim length and Fraud -Done 
+- Number of claims and Fraud - Have to figure this out 
+- Inpatient vs Outpatient - Done 
+
+
+
+
